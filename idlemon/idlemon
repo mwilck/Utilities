@@ -1,0 +1,138 @@
+#! /usr/bin/env python
+# -*- mode: python -*-
+
+# Copyright 2017 Martin Wilck
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+from dbus import *
+from dbus.glib import DBusGMainLoop
+from gi.repository import GLib
+from pwd import getpwnam
+from argparse import ArgumentParser
+from logging import log, basicConfig, CRITICAL, ERROR, WARNING, INFO, DEBUG
+from datetime import datetime
+from time import sleep
+
+dbus_mainloop = DBusGMainLoop(set_as_default=True)
+systembus = SystemBus()
+
+class SessionMonitor(object):
+
+    _bus_name = "org.freedesktop.login1"
+    _obj_path = "/org/freedesktop/login1"
+    _props = "org.freedesktop.DBus.Properties"
+
+    def msg(self, msg, lvl=INFO):
+        log(lvl, msg)
+
+    def idle_timeout(self, *args):
+        if len(self.sessions) == 0:
+            delta = datetime.now() - self._last_new
+            if delta.total_seconds() < self._timeout - 1:
+                self.msg("poweroff canceled by %s" % self._last_ses,
+                         lvl=WARNING)
+                return False
+            self.msg("system was idle for %s seconds, poweroff" %
+                     self._timeout, lvl=CRITICAL)
+            if self._poweroff:
+                self._manager.PowerOff(True)
+        return False
+
+    def check_idle(self):
+        if len(self.sessions) == 0:
+            self.msg("system is idle, poweroff after %d seconds"
+                     % self._timeout, lvl=WARNING)
+            GLib.timeout_add_seconds(self._timeout, self.idle_timeout)
+
+    def get_uid(self, objpath):
+        ses = systembus.get_object(self._bus_name, objpath)
+        user = ses.Get("%s.%s" % (self._bus_name, "Session"), "User",
+                       dbus_interface=self._props)
+        return user[0]
+
+    def session_new(self, id, objpath):
+        uid = self.get_uid(objpath)
+        if (uid not in self._ignore):
+            self.sessions.add(objpath)
+            self._last_new = datetime.now()
+            self._last_ses = id
+        self.msg("user %u created session %s" % (uid, id))
+        self.print_sessions()
+
+    def session_removed(self, id, objpath):
+        if objpath in self.sessions:
+            self.sessions.remove(objpath)
+        self.check_idle()
+        self.msg("session %s ended" % id)
+        self.print_sessions()
+
+    def get_sessions(self):
+        self.sessions.clear()
+        self.sessions.update(s[4] for s in self._manager.ListSessions()
+                             if s[1] not in self._ignore)
+
+    def print_sessions(self):
+        self.msg("%d active sessions" % len(self.sessions))
+
+    def __init__(self, ignore_users=[], timeout=10, dry_run=False):
+        self._timeout = timeout
+        self._ignore = [ getpwnam(x).pw_uid for x in ignore_users ]
+        self._dry_run = dry_run
+
+        self._proxy = systembus.get_object(self._bus_name, self._obj_path)
+        self._manager = Interface(self._proxy,
+                                  dbus_interface=("%s.%s" %
+                                                  (self._bus_name, "Manager")))
+        self._manager.connect_to_signal("SessionNew", self.session_new)
+        self._manager.connect_to_signal("SessionRemoved", self.session_removed)
+        self._poweroff = not dry_run and self._manager.CanPowerOff()
+        self._last_new = datetime.now()
+        self._last_ses = "STARTUP"
+
+        self.sessions = set()
+        self.get_sessions()
+
+        self.msg("ignoring user IDs: %s" %
+                 ", ".join("%d" % x for x in self._ignore))
+        self.msg("poweroff is %sabled" %
+                 ("en" if self._poweroff else "dis"), WARNING)
+        self.print_sessions()
+
+        self.check_idle()
+
+def start_monitor(**kwargs):
+    sm = SessionMonitor(**kwargs)
+    mainloop = GLib.MainLoop()
+    mainloop.run()
+
+if __name__ == "__main__":
+    ps = ArgumentParser()
+    ps.add_argument("-i", "--ignore-user", action="append", default=[],
+                    help="ignore certain users, e.g. \"gdm\"")
+    ps.add_argument("-t", "--timeout", type=int, default=30,
+                    help="time to wait until shutdown")
+    ps.add_argument("-n", "--dry-run", action="store_true")
+    ps.add_argument("-v", "--verbose", action="count", default=0)
+    opts = ps.parse_args()
+    basicConfig(level=ERROR - min(10*opts.verbose, ERROR-DEBUG),
+                format="%(message)s")
+    start_monitor(ignore_users=opts.ignore_user,
+                  timeout=opts.timeout,
+                  dry_run = opts.dry_run)

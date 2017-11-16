@@ -1,0 +1,12 @@
+[Unit]
+Description=system idle monitor
+Requires=systemd-logind.service dbus.service
+After=systemd-logind.service
+Before=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/sessionmon.py -v -i gdm
+
+[Install]
+WantedBy=multi-user.target
